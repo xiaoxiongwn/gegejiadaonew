@@ -1,7 +1,11 @@
 package com.example.searchfloat
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.pm.PackageManager
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.CaptureRequest
 import android.os.Bundle
 import android.util.Log
 import android.util.Size
@@ -13,6 +17,11 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import androidx.camera.core.CameraFilter
+import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.FocusMeteringAction
@@ -464,6 +473,8 @@ data class MatchInfo(
     val confident: Boolean
 )
 
+@OptIn(ExperimentalCamera2Interop::class)
+@SuppressLint("ClickableViewAccessibility")
 @Composable
 fun CameraPreviewView(
     onText: (String) -> Unit,
@@ -489,31 +500,61 @@ fun CameraPreviewView(
             cameraProviderFuture.addListener({
                 try {
                     val provider = cameraProviderFuture.get()
-                    val preview = Preview.Builder().build().also {
-                        it.setSurfaceProvider(previewView.surfaceProvider)
-                    }
-                    // v3.1: 分析器分辨率显式提到 1280x720，默认 640x480 对中文题目 OCR 太糊，
-                    // 用户会本能"往前凑 → 超过最近对焦 → 再拉远"来回震荡。
-                    val resolutionSelector = ResolutionSelector.Builder()
+
+                    // v3.2: 预览分辨率显式设为 1920x1080，让 AF 算法拿到更多细节信号。
+                    val previewResSelector = ResolutionSelector.Builder()
                         .setResolutionStrategy(
                             ResolutionStrategy(
-                                Size(1280, 720),
+                                Size(1920, 1080),
+                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                            )
+                        )
+                        .build()
+                    val previewBuilder = Preview.Builder()
+                        .setResolutionSelector(previewResSelector)
+                    // v3.2: Camera2Interop 显式钉住 CONTROL_AF_MODE_CONTINUOUS_PICTURE，
+                    // 避免个别 ROM（含华为 EMUI）默认走 AUTO / EDOF 之类的模式。
+                    Camera2Interop.Extender(previewBuilder)
+                        .setCaptureRequestOption(
+                            CaptureRequest.CONTROL_AF_MODE,
+                            CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                        )
+                    val preview = previewBuilder.build().also {
+                        it.setSurfaceProvider(previewView.surfaceProvider)
+                    }
+
+                    // v3.2: 分析器 720p → 1080p。ML Kit 中文识别在 1080p 更稳，
+                    // 副作用是每帧耗时 +~30%，但我们节流 600ms，一样吃得住。
+                    val analyzerResSelector = ResolutionSelector.Builder()
+                        .setResolutionStrategy(
+                            ResolutionStrategy(
+                                Size(1920, 1080),
                                 ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
                             )
                         )
                         .build()
                     val analyzer = ImageAnalysis.Builder()
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .setResolutionSelector(resolutionSelector)
+                        .setResolutionSelector(analyzerResSelector)
                         .build()
+
                     val recognizer = TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
                     var lastAnalyzeMs = 0L
                     var processing = false
                     var lastRefocusMs = 0L
                     var emptyStreakStartMs = 0L
-                    val selector = CameraSelector.DEFAULT_BACK_CAMERA
+
+                    // v3.2 方案2: 枚举所有后置镜头，选最近对焦距离最小的那颗。
+                    // LENS_INFO_MINIMUM_FOCUS_DISTANCE 单位是屈光度（1/m），
+                    // 数值越大表示能对焦得越近。华为 Mate 40 上大概率只返回主摄一颗，
+                    // 但如果 ROM 版本暴露了副摄（超广/微距），会自动切到能拍更近的那颗。
+                    val selector = pickClosestFocusBackCamera(provider) ?: CameraSelector.DEFAULT_BACK_CAMERA
+
                     provider.unbindAll()
                     val camera = provider.bindToLifecycle(lifecycleOwner, selector, preview, analyzer)
+
+                    // v3.2: 记录一下我们最终绑到了哪颗镜头，方便看日志。
+                    logBoundCamera(camera.cameraInfo)
 
                     // v3.1: 点按对焦 —— 用户看到糊就点一下题目区域，立即重新 AF/AE。
                     previewView.setOnTouchListener { _, event ->
@@ -532,8 +573,31 @@ fun CameraPreviewView(
                         true
                     }
 
-                    // v3.1: OCR 兜底重对焦 —— 连续 ~1.5 秒没识别到文字就踢一下中心 AF，
-                    // 解决"静止画面 AF 判定稳了 → 手抖后不主动扫焦"的手感问题。
+                    // v3.2: 定时踢 AF —— 每 3 秒对中心区域重新对焦一次，
+                    // 就算 OCR 一直有输出，也主动刷新焦点，模拟原生相机"总在扫焦"的手感。
+                    val periodicRefocus = Runnable {
+                        val w = previewView.width.coerceAtLeast(1)
+                        val h = previewView.height.coerceAtLeast(1)
+                        val center = previewView.meteringPointFactory
+                            .createPoint(w / 2f, h / 2f)
+                        val action = FocusMeteringAction.Builder(
+                            center,
+                            FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
+                        )
+                            .setAutoCancelDuration(2, TimeUnit.SECONDS)
+                            .build()
+                        camera.cameraControl.startFocusAndMetering(action)
+                    }
+                    val periodicHandler = android.os.Handler(android.os.Looper.getMainLooper())
+                    val periodicTask = object : Runnable {
+                        override fun run() {
+                            periodicRefocus.run()
+                            periodicHandler.postDelayed(this, 3000L)
+                        }
+                    }
+                    periodicHandler.postDelayed(periodicTask, 3000L)
+
+                    // v3.1: OCR 兜底重对焦 —— 连续 ~1.5 秒没识别到文字就踢一下中心 AF。
                     analyzer.setAnalyzer(analyzerExecutor) { proxy ->
                         val now = System.currentTimeMillis()
                         if (processing || now - lastAnalyzeMs < 600) {
@@ -581,6 +645,99 @@ fun CameraPreviewView(
 
     DisposableEffect(Unit) {
         onDispose { analyzerExecutor.shutdown() }
+    }
+}
+
+/**
+ * v3.2 方案2: 从 provider 拿到所有后置 CameraInfo，
+ * 用 Camera2CameraInfo 读 LENS_INFO_MINIMUM_FOCUS_DISTANCE，
+ * 选屈光度最大（=能对得最近）的那颗。
+ *
+ * 华为 Mate 40 上第三方 App 常常只能看到主摄一颗；如果 ROM 只返回一颗，
+ * 此函数就会返回那一颗对应的 CameraSelector，等价于原 DEFAULT_BACK_CAMERA。
+ * 如果幸运返回多颗，会切到最能拍近处的镜头，实测能扩大清晰高度范围。
+ */
+@OptIn(ExperimentalCamera2Interop::class)
+private fun pickClosestFocusBackCamera(provider: ProcessCameraProvider): CameraSelector? {
+    return try {
+        val backInfos: List<CameraInfo> = provider.availableCameraInfos.filter { info ->
+            try {
+                Camera2CameraInfo.from(info)
+                    .getCameraCharacteristic(CameraCharacteristics.LENS_FACING) ==
+                    CameraCharacteristics.LENS_FACING_BACK
+            } catch (_: Throwable) {
+                false
+            }
+        }
+        if (backInfos.isEmpty()) return null
+
+        // 记一下每颗镜头的能力，方便你在 logcat 里看到底华为暴露了几颗。
+        backInfos.forEachIndexed { idx, info ->
+            val c2 = Camera2CameraInfo.from(info)
+            val id = c2.cameraId
+            val minFocusDist = c2.getCameraCharacteristic(
+                CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE
+            )
+            val focalLengths = c2.getCameraCharacteristic(
+                CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS
+            )?.joinToString()
+            Log.i(
+                "LiveScan",
+                "back cam #$idx id=$id minFocusDist(diopter)=$minFocusDist focalLens=$focalLengths"
+            )
+        }
+
+        // 选屈光度最大的一颗（能对焦得最近）。
+        val best = backInfos.maxByOrNull { info ->
+            val d = try {
+                Camera2CameraInfo.from(info)
+                    .getCameraCharacteristic(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+            } catch (_: Throwable) {
+                null
+            }
+            d ?: -1f
+        } ?: return null
+
+        val bestId = try {
+            Camera2CameraInfo.from(best).cameraId
+        } catch (_: Throwable) {
+            return null
+        }
+        Log.i("LiveScan", "picked back cam id=$bestId (closest focus)")
+
+        // 用 CameraFilter 把选择限制到目标 cameraId。
+        CameraSelector.Builder()
+            .requireLensFacing(CameraSelector.LENS_FACING_BACK)
+            .addCameraFilter(CameraFilter { infos ->
+                infos.filter { info ->
+                    try {
+                        Camera2CameraInfo.from(info).cameraId == bestId
+                    } catch (_: Throwable) {
+                        false
+                    }
+                }
+            })
+            .build()
+    } catch (t: Throwable) {
+        Log.w("LiveScan", "pickClosestFocusBackCamera failed", t)
+        null
+    }
+}
+
+@OptIn(ExperimentalCamera2Interop::class)
+private fun logBoundCamera(info: CameraInfo) {
+    try {
+        val c2 = Camera2CameraInfo.from(info)
+        val id = c2.cameraId
+        val focal = c2.getCameraCharacteristic(
+            CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS
+        )?.joinToString()
+        val minFocus = c2.getCameraCharacteristic(
+            CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE
+        )
+        Log.i("LiveScan", "bound camera id=$id focal=$focal minFocusDist=$minFocus")
+    } catch (t: Throwable) {
+        Log.w("LiveScan", "logBoundCamera failed", t)
     }
 }
 
