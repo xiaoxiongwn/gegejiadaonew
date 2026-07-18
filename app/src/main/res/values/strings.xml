@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">悬浮搜题</string>
+    <string name="app_name">格格驾到</string>
     <string name="accessibility_desc">自动读取屏幕文字并匹配题库答案</string>
 </resources>
