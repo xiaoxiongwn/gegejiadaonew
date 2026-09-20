@@ -30,10 +30,7 @@ object XlsParser {
         return emptyList()
     }
 
-    private val YELLOW_COLOURS = setOf(
-        Colour.YELLOW, Colour.YELLOW2, Colour.LIGHT_YELLOW, Colour.GOLD,
-        Colour.LIGHT_ORANGE
-    )
+    private val YELLOW_COLOURS = setOf(Colour.YELLOW, Colour.YELLOW2)
 
     private fun isYellowRgb(rgb: RGB?): Boolean {
         if (rgb == null) return false
