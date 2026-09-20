@@ -3,8 +3,10 @@ package com.example.searchfloat.util
 import android.content.Context
 import android.net.Uri
 import jxl.Workbook
+import jxl.format.Colour
+import jxl.format.RGB
 
-/** 老 Excel .xls / BIFF 解析器：负责 IO + 单元格抽取，识别交给 SmartTableParser。 */
+/** 老 Excel .xls / BIFF 解析器：IO + 单元格抽取 + 黄色高亮识别，交给 SmartTableParser。 */
 object XlsParser {
 
     fun parse(context: Context, uri: Uri): List<ParsedRow> =
@@ -14,13 +16,13 @@ object XlsParser {
         context.contentResolver.openInputStream(uri)?.use { input ->
             val workbook = Workbook.getWorkbook(input)
             try {
-                var best: List<QuestionRecord> = emptyList()
+                val all = mutableListOf<QuestionRecord>()
                 for (sheet in workbook.sheets) {
-                    val rows = extractRows(sheet)
-                    val records = SmartTableParser.parse(rows)
-                    if (records.size > best.size) best = records
+                    val (rows, highlights) = extractRowsWithFill(sheet)
+                    val enriched = SheetEnricher.enrich(sheet.name, rows, highlights)
+                    all += SmartTableParser.parse(enriched)
                 }
-                return best
+                return all
             } finally {
                 workbook.close()
             }
@@ -28,12 +30,34 @@ object XlsParser {
         return emptyList()
     }
 
-    private fun extractRows(sheet: jxl.Sheet): List<List<String>> {
-        val out = mutableListOf<List<String>>()
+    private val YELLOW_COLOURS = setOf(
+        Colour.YELLOW, Colour.YELLOW2, Colour.LIGHT_YELLOW, Colour.GOLD,
+        Colour.LIGHT_ORANGE
+    )
+
+    private fun isYellowRgb(rgb: RGB?): Boolean {
+        if (rgb == null) return false
+        val r = rgb.red; val g = rgb.green; val b = rgb.blue
+        return r >= 200 && g >= 180 && b <= 170 && (r + g) > 2 * b
+    }
+
+    private fun extractRowsWithFill(sheet: jxl.Sheet): Pair<List<List<String>>, List<Set<Int>>> {
+        val rows = mutableListOf<List<String>>()
+        val highlights = mutableListOf<Set<Int>>()
         for (r in 0 until sheet.rows) {
             val row = (0 until sheet.columns).map { c -> sheet.getCell(c, r).contents ?: "" }
-            if (row.any { it.trim().isNotBlank() && it.trim() != "\\" }) out.add(row)
+            if (row.none { it.trim().isNotBlank() && it.trim() != "\\" }) continue
+            val hl = (0 until sheet.columns)
+                .filter { c ->
+                    val cell = sheet.getCell(c, r)
+                    val bg = cell.cellFormat?.backgroundColour
+                    val yellow = bg != null && (bg in YELLOW_COLOURS || isYellowRgb(bg.defaultRGB))
+                    yellow && cell.contents.trim().isNotBlank()
+                }
+                .toSet()
+            rows.add(row)
+            highlights.add(hl)
         }
-        return out
+        return rows to highlights
     }
 }
